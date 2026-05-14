@@ -10,6 +10,7 @@
 
 import logging
 import os
+import hashlib
 from abc import ABC, abstractmethod
 from typing import List, Optional
 
@@ -33,6 +34,47 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _faiss_cache: Optional[FAISS] = None
+
+
+def _document_hash(doc: Document) -> str:
+    normalized = " ".join(doc.page_content.lower().split())
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def _ensure_content_hashes(docs: List[Document]) -> List[Document]:
+    for doc in docs:
+        doc.metadata.setdefault("content_hash", _document_hash(doc))
+    return docs
+
+
+def _existing_content_hashes(store: Optional[FAISS]) -> set[str]:
+    if store is None:
+        return set()
+
+    hashes: set[str] = set()
+    docstore = getattr(store, "docstore", None)
+    raw_docs = getattr(docstore, "_dict", {}) if docstore is not None else {}
+    for doc in raw_docs.values():
+        content_hash = getattr(doc, "metadata", {}).get("content_hash")
+        if content_hash:
+            hashes.add(content_hash)
+    return hashes
+
+
+def _dedupe_against_store(docs: List[Document], store: Optional[FAISS]) -> List[Document]:
+    existing_hashes = _existing_content_hashes(store)
+    seen_hashes = set(existing_hashes)
+    unique_docs: List[Document] = []
+
+    for doc in _ensure_content_hashes(docs):
+        content_hash = doc.metadata["content_hash"]
+        if content_hash in seen_hashes:
+            logger.info("Skipping duplicate document hash %s from %s", content_hash[:12], doc.metadata.get("source"))
+            continue
+        seen_hashes.add(content_hash)
+        unique_docs.append(doc)
+
+    return unique_docs
 
 
 def get_vector_store() -> Optional[FAISS]:
@@ -76,7 +118,7 @@ def save_documents_to_store(docs: List[Document]) -> int:
     if not docs:
         raise ValueError("docs list is empty — nothing to ingest.")
 
-    chunks = split_documents(docs)
+    chunks = split_documents(_ensure_content_hashes(docs))
     embeddings = get_embeddings()
 
     store = FAISS.from_documents(chunks, embeddings)
@@ -106,13 +148,21 @@ class FAISSStore(BaseVectorStore):
         self._store: Optional[FAISS] = get_vector_store()  # reuse cached load
 
     def ingest_documents(self, docs: List[Document]) -> int:
-        chunks = split_documents(docs)
+        global _faiss_cache
+
+        unique_docs = _dedupe_against_store(docs, self._store)
+        if not unique_docs:
+            logger.info("No new documents to ingest after content-hash deduplication")
+            return 0
+
+        chunks = split_documents(unique_docs)
         if self._store is None:
             self._store = FAISS.from_documents(chunks, self._embeddings)
         else:
             self._store.add_documents(chunks)
         os.makedirs(FAISS_INDEX_PATH, exist_ok=True)
         self._store.save_local(FAISS_INDEX_PATH)
+        _faiss_cache = self._store
         logger.info("Ingested %d chunks via HTTP route", len(chunks))
         return len(chunks)
 
