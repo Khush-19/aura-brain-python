@@ -1,8 +1,6 @@
-# RAG pipeline — retrieves context from FAISS and generates a Sydney insider tip via GPT-4o.
-# Features:
-#   - Similarity score thresholding (prevents hallucination on low-confidence retrievals)
-#   - Confidence scoring (tracks retrieval quality)
-#   - Metadata TTL validation (ensures data freshness)
+"""End-to-end RAG pipeline for Aura Brain."""
+
+from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
@@ -16,19 +14,11 @@ from langchain_openai import ChatOpenAI
 from openai import APIConnectionError, APITimeoutError, RateLimitError
 from pydantic import SecretStr
 
-from app.config import CHAT_MODEL, OPENAI_API_KEY, OPENAI_TIMEOUT, TOP_K_RESULTS
-from app.rag.retriever import get_vector_store
+from app.config import CHAT_MODEL, MIN_SIMILARITY_THRESHOLD, OPENAI_API_KEY, OPENAI_TIMEOUT, TOP_K_RESULTS
+from app.rag.retriever import retrieve_documents
 
 logger = logging.getLogger(__name__)
 
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
-
-# Minimum similarity score required; below this triggers "no relevant context" response
-MIN_SIMILARITY_THRESHOLD: float = 0.70
-
-# TTL rules: how long before data is considered stale (in seconds).
 TTL_RULES: dict[str, int] = {
     "alert": 24 * 3600,
     "alerts": 24 * 3600,
@@ -36,44 +26,40 @@ TTL_RULES: dict[str, int] = {
     "events": 7 * 24 * 3600,
 }
 
-# Confidence thresholds for categorizing retrieval quality
 CONFIDENCE_THRESHOLDS: dict[str, float] = {
-    "high": 0.85,  # avg score > 0.85, multiple relevant docs
-    "medium": 0.70,  # avg score > 0.70 or mixed quality
-    "low": 0.0,  # below threshold, fallback used
+    "high": 0.85,
+    "medium": MIN_SIMILARITY_THRESHOLD,
+    "low": 0.0,
 }
 
 
 class RetrievalResult(TypedDict):
-    """Typed result of a retrieval with confidence metadata."""
     documents: List[Document]
     scores: List[float]
-    confidence: str  # "high", "medium", "low"
+    confidence: str
     avg_score: float
-    warning: Optional[str]  # e.g., "Data is 3 days old"
+    warning: Optional[str]
 
 
 class PipelineResult(TypedDict):
-    """API-safe result returned by the RAG pipeline."""
     tip: str
     confidence: str
     confidence_score: float
     sources: List[dict[str, Any]]
     warning: Optional[str]
 
-# ============================================================================
-# LangChain chain (built once at import time, reused across requests)
-# ============================================================================
 
 _PROMPT = PromptTemplate(
     input_variables=["context", "query", "vibe_context", "confidence_notice"],
     template=(
-        "You are the Aura Health Companion, a local Sydney expert. "
-        "Answer the user using ONLY the provided Context. "
-        'Add a warm, conversational "Insider Tip" vibe. '
-        "If the context mentions the user's current vibe ({vibe_context}), tailor the advice. "
-        "{confidence_notice}"
-        "\n\nContext: {context}\n\nQuery: {query}"
+        "You are Aura Brain, a local Sydney insider tips engine. "
+        "Answer using only the provided context. If the context does not support "
+        "a claim, say briefly that you do not have enough fresh evidence. "
+        "Keep the tone warm, concise, and useful. "
+        "Tailor the advice to this user context when relevant: {vibe_context}. "
+        "{confidence_notice}\n\n"
+        "Context:\n{context}\n\n"
+        "Query: {query}"
     ),
 )
 
@@ -89,10 +75,6 @@ def _get_chain():
     )
     return _PROMPT | llm | StrOutputParser()
 
-
-# ============================================================================
-# RETRIEVAL HARDENING: Validation & Thresholding
-# ============================================================================
 
 def _ttl_key_for_metadata(metadata: dict[str, Any]) -> Optional[str]:
     source_type = str(
@@ -110,12 +92,17 @@ def _ttl_key_for_metadata(metadata: dict[str, Any]) -> Optional[str]:
     return None
 
 
-def is_data_stale(doc: Document) -> Tuple[bool, Optional[str]]:
-    """
-    Check if a document has exceeded its TTL.
+def _format_age(seconds: float) -> str:
+    if seconds < 60:
+        return f"{int(seconds)}s"
+    if seconds < 3600:
+        return f"{int(seconds / 60)}m"
+    if seconds < 86400:
+        return f"{int(seconds / 3600)}h"
+    return f"{int(seconds / 86400)}d"
 
-    Returns (is_stale: bool, warning: Optional[str])
-    """
+
+def is_data_stale(doc: Document) -> Tuple[bool, Optional[str]]:
     try:
         ttl_key = _ttl_key_for_metadata(doc.metadata)
         if ttl_key is None:
@@ -125,139 +112,72 @@ def is_data_stale(doc: Document) -> Tuple[bool, Optional[str]]:
         if not scraped_at:
             return True, "scraped_at metadata missing"
 
-        scraped_datetime = datetime.fromisoformat(scraped_at.replace("Z", "+00:00"))
+        scraped_datetime = datetime.fromisoformat(str(scraped_at).replace("Z", "+00:00"))
         if scraped_datetime.tzinfo is None:
             scraped_datetime = scraped_datetime.replace(tzinfo=timezone.utc)
 
-        now = datetime.now(timezone.utc)
-
         ttl_seconds = TTL_RULES[ttl_key]
-        age_seconds = (now - scraped_datetime).total_seconds()
+        age_seconds = (datetime.now(timezone.utc) - scraped_datetime).total_seconds()
 
         if age_seconds > ttl_seconds:
-            age_human = _format_age(age_seconds)
-            return True, f"Data is {age_human} old (TTL: {ttl_seconds // 3600}h)"
+            return True, f"Data is {_format_age(age_seconds)} old (TTL: {ttl_seconds // 3600}h)"
 
-        # Warn if approaching TTL
         if age_seconds > ttl_seconds * 0.8:
-            age_human = _format_age(age_seconds)
-            return False, f"Data is {age_human} old (refresh soon)"
+            return False, f"Data is {_format_age(age_seconds)} old (refresh soon)"
 
         return False, None
-
     except Exception as exc:
-        logger.warning("Failed to parse scraped_at: %s", exc)
+        logger.warning("Failed to parse scraped_at metadata: %s", exc)
         return True, "scraped_at parsing error"
 
 
-def _format_age(seconds: float) -> str:
-    """Format duration in seconds to human-readable string."""
-    if seconds < 60:
-        return f"{int(seconds)}s"
-    elif seconds < 3600:
-        return f"{int(seconds / 60)}m"
-    elif seconds < 86400:
-        return f"{int(seconds / 3600)}h"
-    else:
-        return f"{int(seconds / 86400)}d"
-
-
-def _relevance_to_similarity(raw_score: float) -> float:
-    """
-    Clamp vector-store relevance scores into a 0..1 similarity value.
-
-    LangChain's `similarity_search_with_relevance_scores` already returns higher
-    scores for better matches. Clamping protects the API contract if a backend
-    returns a value just outside the expected range.
-    """
-    return max(0.0, min(1.0, raw_score))
-
-
-def _distance_to_similarity(distance: float) -> float:
-    """Convert a raw vector distance where 0 is best into 0..1 similarity."""
-    if distance < 0:
-        return 0.0
-    return 1.0 / (1.0 + distance)
-
-
 def retrieve_with_scoring(query: str, top_k: int = TOP_K_RESULTS) -> RetrievalResult:
-    """
-    Retrieve documents with similarity scores and validate for staleness.
+    # 1. Fetch results (Assuming this returns List[Tuple[Document, float]])
+    results: List[Tuple[Document, float]] = retrieve_documents(query, top_k=top_k)
+    
+    valid_docs: List[Document] = []
+    valid_scores: List[float] = []
+    staleness_warnings: List[str] = []
+    threshold_warnings = 0
 
-    Returns RetrievalResult with:
-    - documents: filtered list of non-stale docs passing threshold
-    - scores: cosine similarity scores [0..1]
-    - confidence: "high" / "medium" / "low"
-    - avg_score: average similarity of returned docs
-    - warning: optional staleness warning
-    """
-    store = get_vector_store()
-    if store is None:
-        return {
-            "documents": [],
-            "scores": [],
-            "confidence": "low",
-            "avg_score": 0.0,
-            "warning": "Vector store not initialized",
-        }
-
-    try:
-        raw_results = store.similarity_search_with_relevance_scores(query, k=top_k)
-        results = [
-            (doc, _relevance_to_similarity(float(score)))
-            for doc, score in raw_results
-        ]
-    except AttributeError:
-        try:
-            raw_results = store.similarity_search_with_score(query, k=top_k)
-            results = [
-                (doc, _distance_to_similarity(float(score)))
-                for doc, score in raw_results
-            ]
-        except AttributeError:
-            logger.warning("Vector store doesn't expose scored search; using conservative fallback")
-            results = [(doc, 0.0) for doc in store.similarity_search(query, k=top_k)]
-
-    raw_docs = [doc for doc, _ in results]
-    raw_scores = [score for _, score in results]
-
-    # Filter out stale documents
-    filtered_docs = []
-    filtered_scores = []
-    staleness_warnings = []
-
-    for doc, score in zip(raw_docs, raw_scores):
+    # 2. Correctly unpack the tuple
+    for doc, score in results:
+        # Pylance now recognizes 'doc' as Document and 'score' as float
         is_stale, warning = is_data_stale(doc)
+        
         if is_stale:
-            staleness_warnings.append(warning)
-            continue  # Skip stale documents
+            if warning:
+                staleness_warnings.append(warning)
+            continue
 
-        filtered_docs.append(doc)
-        filtered_scores.append(score)
+        # Ensure similarity score is a valid float
+        try:
+            similarity = max(0.0, min(1.0, float(score)))
+        except (ValueError, TypeError):
+            similarity = 0.0
 
-    # Check if any docs pass threshold
-    valid_docs = []
-    valid_scores = []
-
-    for doc, score in zip(filtered_docs, filtered_scores):
-        similarity = _relevance_to_similarity(float(score))
-        if similarity > MIN_SIMILARITY_THRESHOLD:
+        if similarity >= MIN_SIMILARITY_THRESHOLD:
             valid_docs.append(doc)
             valid_scores.append(similarity)
+        else:
+            threshold_warnings += 1
 
-    # Calculate confidence
+    # 3. Calculate metrics
     avg_score = sum(valid_scores) / len(valid_scores) if valid_scores else 0.0
+    
+    # 4. Determine confidence level
     confidence = "low"
-
     if len(valid_docs) >= 2 and avg_score >= CONFIDENCE_THRESHOLDS["high"]:
         confidence = "high"
     elif len(valid_docs) >= 1 and avg_score >= CONFIDENCE_THRESHOLDS["medium"]:
         confidence = "medium"
 
-    # Compile warning
+    # 5. Handle warnings
     warning_msg = None
     if staleness_warnings and not valid_docs:
         warning_msg = f"Retrieved docs are stale: {staleness_warnings[0]}"
+    elif threshold_warnings and not valid_docs:
+        warning_msg = "Retrieved docs did not meet the similarity threshold."
     elif staleness_warnings:
         logger.info("Filtered out stale docs: %s", staleness_warnings)
 
@@ -268,11 +188,6 @@ def retrieve_with_scoring(query: str, top_k: int = TOP_K_RESULTS) -> RetrievalRe
         "avg_score": avg_score,
         "warning": warning_msg,
     }
-
-
-# ---------------------------------------------------------------------------
-# Public function
-# ---------------------------------------------------------------------------
 
 def _source_metadata(doc: Document, score: float) -> dict[str, Any]:
     return {
@@ -285,16 +200,6 @@ def _source_metadata(doc: Document, score: float) -> dict[str, Any]:
 
 
 def generate_insider_tip(query: str, vibe_context: Optional[str] = None) -> PipelineResult:
-    """
-    Full RAG cycle:
-      1. Load the FAISS vector store
-      2. Retrieve the top-k most relevant chunks via similarity search
-      3. Inject context + vibe into the Aura prompt
-      4. Stream through ChatOpenAI (gpt-4o) and return the string response
-
-    Raises openai.APITimeoutError / APIConnectionError / RateLimitError on
-    upstream failures — callers (routes.py) map these to HTTP status codes.
-    """
     retrieval = retrieve_with_scoring(query)
     docs = retrieval["documents"]
     scores = retrieval["scores"]
@@ -323,7 +228,7 @@ def generate_insider_tip(query: str, vibe_context: Optional[str] = None) -> Pipe
             {
                 "context": context,
                 "query": query,
-                "vibe_context": vibe_context or "general",
+                "vibe_context": vibe_context or "balanced",
                 "confidence_notice": confidence_notice,
             }
         )
@@ -335,11 +240,11 @@ def generate_insider_tip(query: str, vibe_context: Optional[str] = None) -> Pipe
             "warning": retrieval["warning"],
         }
     except RateLimitError:
-        logger.warning("OpenAI rate limit hit for query: %.60s…", query)
+        logger.warning("OpenAI rate limit hit for query: %.60s", query)
         raise
     except APITimeoutError:
-        logger.error("OpenAI request timed out for query: %.60s…", query)
+        logger.error("OpenAI request timed out for query: %.60s", query)
         raise
     except APIConnectionError:
-        logger.error("OpenAI connection error for query: %.60s…", query)
+        logger.error("OpenAI connection error for query: %.60s", query)
         raise

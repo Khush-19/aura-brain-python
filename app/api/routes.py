@@ -1,43 +1,26 @@
 # API route definitions for Aura Brain.
-# /api/v1/query  — generate a personalised Sydney insider tip
-# /api/v1/ingest — scrape sources and populate the vector store
+# /api/v1/query  - generate a personalised Sydney insider tip
+# /api/v1/ingest - scrape sources and populate the vector store
 
 import logging
-import re
 import time
 from collections import defaultdict, deque
 from threading import Lock
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from fastapi import APIRouter, HTTPException, status
 from openai import APIConnectionError, APITimeoutError, OpenAIError, RateLimitError
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, HttpUrl, field_validator
 
+from app.config import VECTOR_STORE
 from app.rag.ingestion import SYDNEY_SOURCES, Scraper, SourceConfig
 from app.rag.pipeline import generate_insider_tip
 from app.rag.retriever import ingest_documents
+from app.utils.validation import sanitize_vibe
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
-
-_SAFE_VIBE_RE = re.compile(r"[^A-Za-z0-9 ]+")
-_PROMPT_CONTROL_RE = re.compile(
-    r"\b(ignore|instruction|system|developer|prompt|override|jailbreak|roleplay|assistant|script)\b",
-    re.IGNORECASE,
-)
-
-
-def sanitize_vibe(vibe: str) -> str:
-    """Allow only alphanumeric characters and spaces in vibe text."""
-    if _PROMPT_CONTROL_RE.search(vibe or ""):
-        return "balanced"
-    sanitized = _SAFE_VIBE_RE.sub("", vibe or "")
-    sanitized = " ".join(sanitized.split())
-    if _PROMPT_CONTROL_RE.search(sanitized):
-        return "balanced"
-    return sanitized[:60] or "balanced"
-
 
 class InMemoryRateLimiter:
     """Simple per-user sliding-window limiter for a single API process."""
@@ -92,13 +75,12 @@ class QueryResponse(BaseModel):
     user_id: str
     confidence: str
     confidence_score: float
-    sources: List[dict]
+    sources: List[dict[str, Any]]
     warning: Optional[str] = None
 
 
 class IngestRequest(BaseModel):
-    # Optional list of custom URLs; falls back to the curated SYDNEY_SOURCES list
-    urls: Optional[List[str]] = Field(
+    urls: Optional[List[HttpUrl]] = Field(
         default=None,
         description="Custom URLs to scrape. Leave empty to use default Sydney sources.",
     )
@@ -115,7 +97,7 @@ class IngestResponse(BaseModel):
 
 @router.get("/health", tags=["ops"])
 def health():
-    return {"status": "ok", "service": "Aura Brain"}
+    return {"status": "ok", "service": "Aura Brain", "vector_store": VECTOR_STORE}
 
 
 @router.post(
@@ -128,7 +110,8 @@ def query_insider_tip(payload: QueryRequest):
     query_rate_limiter.check(payload.user_id)
 
     try:
-        result = generate_insider_tip(payload.query, vibe_context=payload.vibe)
+        vibe_context = f"vibe={payload.vibe}; aura_score={payload.aura_score:.0f}/100"
+        result = generate_insider_tip(payload.query, vibe_context=vibe_context)
     except APITimeoutError:
         raise HTTPException(
             status_code=status.HTTP_504_GATEWAY_TIMEOUT,
@@ -148,6 +131,12 @@ def query_insider_tip(payload: QueryRequest):
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="OpenAI is not configured or temporarily unavailable.",
+        )
+    except RuntimeError as exc:
+        logger.exception("Runtime configuration error in query pipeline: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="RAG backend is not configured or temporarily unavailable.",
         )
     except Exception as exc:
         logger.exception("Unexpected error in query pipeline: %s", exc)
@@ -177,7 +166,7 @@ def ingest(payload: IngestRequest):
 
     if payload.urls:
         sources = [
-            SourceConfig(url=url, name=url, source_type="custom") for url in payload.urls
+            SourceConfig(url=str(url), name=str(url), source_type="custom") for url in payload.urls
         ]
     else:
         sources = SYDNEY_SOURCES
@@ -199,11 +188,17 @@ def ingest(payload: IngestRequest):
 
     try:
         chunks = ingest_documents(docs)
+    except RuntimeError as exc:
+        logger.exception("Vector store configuration error: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc),
+        )
     except Exception as exc:
         logger.exception("Vector store ingestion failed: %s", exc)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Content scraped but failed to embed and store.",
+            detail="Content scraped but failed to store in the configured vector backend.",
         )
 
     return IngestResponse(chunks_ingested=chunks, sources_scraped=len(docs))

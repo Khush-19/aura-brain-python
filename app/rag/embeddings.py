@@ -1,21 +1,36 @@
-# Embedding layer — single source of truth for the OpenAI embedding model and text splitter.
+"""Local FAISS helpers.
 
+OpenAIEmbeddings is imported lazily inside get_embeddings() so the production
+Pinecone integrated-inference path never imports or initializes client-side
+embedding code.
+"""
+
+from functools import lru_cache
 from typing import List
 
-from langchain_openai import OpenAIEmbeddings
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from pydantic import SecretStr
 
 from app.config import CHUNK_OVERLAP, CHUNK_SIZE, EMBEDDING_MODEL, OPENAI_API_KEY
 
 
-def get_embeddings() -> OpenAIEmbeddings:
-    """Return a configured OpenAIEmbeddings instance (text-embedding-3-small)."""
-    return OpenAIEmbeddings(model=EMBEDDING_MODEL, api_key=OPENAI_API_KEY)
+@lru_cache(maxsize=1)
+def get_embeddings():
+    """Return OpenAI embeddings for the local FAISS fallback only."""
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY is required when VECTOR_STORE=faiss.")
+
+    from langchain_openai import OpenAIEmbeddings
+
+    return OpenAIEmbeddings(
+        model=EMBEDDING_MODEL,
+        api_key=SecretStr(OPENAI_API_KEY),
+    )
 
 
 def split_documents(docs: List[Document]) -> List[Document]:
-    """Split documents into chunks of CHUNK_SIZE with CHUNK_OVERLAP overlap."""
+    """Split documents into chunks without embedding them."""
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE,
         chunk_overlap=CHUNK_OVERLAP,

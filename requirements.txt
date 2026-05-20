@@ -12,6 +12,7 @@ langchain-text-splitters>=0.3,<1
 faiss-cpu>=1.8,<2
 
 requests>=2.32,<3
+urllib3<2
 beautifulsoup4>=4.12,<5
 lxml>=5,<7
 tenacity>=8.2,<10
@@ -20,4 +21,3 @@ playwright>=1.45,<2
 APScheduler>=3.10,<4
 
 pinecone>=5,<8
-langchain-pinecone>=0.2,<1

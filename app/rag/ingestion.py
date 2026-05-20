@@ -1,4 +1,4 @@
-# Ingestion engine — scrapes Sydney lifestyle and NSW gov sources into LangChain Documents.
+# Ingestion engine - scrapes Sydney lifestyle and NSW gov sources into LangChain Documents.
 #
 # JS-heavy pages can opt into Playwright via SourceConfig(use_playwright=True).
 
@@ -6,7 +6,7 @@ import logging
 import hashlib
 import time
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Iterable, List, Optional
 
 import requests
 from bs4 import BeautifulSoup
@@ -14,6 +14,7 @@ from langchain_core.documents import Document
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from app.config import SCRAPER_TIMEOUT
+from app.utils.validation import pinecone_safe_metadata
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +60,7 @@ SYDNEY_SOURCES: List[SourceConfig] = [
 ]
 
 # ---------------------------------------------------------------------------
-# HTML → clean text cleaner
+# HTML clean text cleaner
 # ---------------------------------------------------------------------------
 
 class HTMLMarkdownCleaner:
@@ -71,14 +72,21 @@ class HTMLMarkdownCleaner:
     _STRIP_TAGS = {"script", "style", "nav", "footer", "header", "aside", "iframe", "noscript", "form"}
     _BLOCK_TAGS = {"h1", "h2", "h3", "h4", "p", "li", "blockquote", "td", "th"}
 
-    def clean(self, html: str) -> str:
+    def clean(self, html: str, selectors: Optional[Iterable[str]] = None) -> str:
         soup = BeautifulSoup(html, "lxml")
 
         for tag in soup(list(self._STRIP_TAGS)):
             tag.decompose()
 
+        root = soup
+        for selector in selectors or []:
+            selected = soup.select_one(selector)
+            if selected is not None:
+                root = selected
+                break
+
         blocks: List[str] = []
-        for tag in soup.find_all(self._BLOCK_TAGS):
+        for tag in root.find_all(self._BLOCK_TAGS):
             text = tag.get_text(separator=" ", strip=True)
             if len(text) < 25:
                 continue
@@ -88,7 +96,10 @@ class HTMLMarkdownCleaner:
                 text = f"### {text}"
             blocks.append(text)
 
-        return "\n\n".join(blocks)
+        if blocks:
+            return "\n\n".join(blocks)
+
+        return root.get_text(separator="\n", strip=True)
 
 
 # ---------------------------------------------------------------------------
@@ -195,20 +206,23 @@ class Scraper:
             logger.error("Fetch failed [%s]: %s", source.url, exc)
             return None
 
-        text = self.cleaner.clean(html)
+        text = self.cleaner.clean(html, source.content_selectors)
         text = text.strip()
         if not self._validate_content(source, text):
             return None
 
+        source_type = source.source_type.strip().lower() or "custom"
         return Document(
             page_content=text,
-            metadata={
+            metadata=pinecone_safe_metadata({
                 "source": source.url,
                 "name": source.name,
-                "type": source.source_type,
+                "type": source_type,
+                "source_type": source_type,
+                "category": source_type,
                 "content_hash": self._content_hash(text),
                 "scraped_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            },
+            }),
         )
 
     def scrape_all(self, sources: Optional[List[SourceConfig]] = None) -> List[Document]:

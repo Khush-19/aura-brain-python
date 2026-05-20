@@ -1,10 +1,10 @@
 """
-Seed script — populates the local FAISS index with curated Sydney insider tips.
+Seed script - populates the local FAISS index with curated Sydney insider tips.
 
 Usage (run from the project root):
     python scripts/seed_data.py
 
-Requires OPENAI_API_KEY to be set in .env (used for embedding the documents).
+Requires OPENAI_API_KEY to be set in .env because local FAISS embeds client-side.
 """
 
 import sys
@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from langchain_core.documents import Document
 
 from app.rag.retriever import save_documents_to_store
+from app.utils.validation import pinecone_safe_metadata
 
 
 SYDNEY_INSIDER_DOCS = [
@@ -29,7 +30,14 @@ SYDNEY_INSIDER_DOCS = [
             "Skip the ground-floor vending machines — overpriced and the coffee is bad. "
             "The nearest decent flat white is Taste Baguette on City Road, about a 7-minute walk."
         ),
-        metadata={"source": "aura_seed", "category": "study", "location": "USYD, Camperdown"},
+        metadata=pinecone_safe_metadata({
+            "source": "aura_seed",
+            "name": "Aura Seed",
+            "type": "study",
+            "source_type": "study",
+            "category": "study",
+            "location": "USYD, Camperdown",
+        }),
     ),
     Document(
         page_content=(
@@ -43,7 +51,14 @@ SYDNEY_INSIDER_DOCS = [
             "Best visit windows: Tuesday and Thursday 11:30 AM–1 PM. "
             "The free gas BBQs near the playground work well for group hangs; allow 20 minutes warm-up time."
         ),
-        metadata={"source": "aura_seed", "category": "outdoor", "location": "Camperdown / Glebe"},
+        metadata=pinecone_safe_metadata({
+            "source": "aura_seed",
+            "name": "Aura Seed",
+            "type": "outdoor",
+            "source_type": "outdoor",
+            "category": "outdoor",
+            "location": "Camperdown / Glebe",
+        }),
     ),
     Document(
         page_content=(
@@ -58,7 +73,14 @@ SYDNEY_INSIDER_DOCS = [
             "Transport: parking on King St is a nightmare. Take the 422 bus or walk 10 minutes from Newtown station. "
             "Vibe: creative, independent, slightly hipster — great for focused solo work or a casual first meeting."
         ),
-        metadata={"source": "aura_seed", "category": "cafe", "location": "Newtown, King St"},
+        metadata=pinecone_safe_metadata({
+            "source": "aura_seed",
+            "name": "Aura Seed",
+            "type": "cafe",
+            "source_type": "cafe",
+            "category": "cafe",
+            "location": "Newtown, King St",
+        }),
     ),
     Document(
         page_content=(
@@ -74,7 +96,14 @@ SYDNEY_INSIDER_DOCS = [
             "Tamarama ('Glamarama') Beach is tiny and locals-only — strong rip current, no flags on weekdays, "
             "don't swim there unless conditions are perfect."
         ),
-        metadata={"source": "aura_seed", "category": "outdoor", "location": "Bondi to Coogee"},
+        metadata=pinecone_safe_metadata({
+            "source": "aura_seed",
+            "name": "Aura Seed",
+            "type": "outdoor",
+            "source_type": "outdoor",
+            "category": "outdoor",
+            "location": "Bondi to Coogee",
+        }),
     ),
     Document(
         page_content=(
@@ -90,7 +119,14 @@ SYDNEY_INSIDER_DOCS = [
             "Vibe: loud, community-heavy, genuinely dog-friendly, great for a solo Saturday morning or a relaxed "
             "first date — the energy is warm and unhurried before 9 AM."
         ),
-        metadata={"source": "aura_seed", "category": "market", "location": "Eveleigh / Redfern"},
+        metadata=pinecone_safe_metadata({
+            "source": "aura_seed",
+            "name": "Aura Seed",
+            "type": "market",
+            "source_type": "market",
+            "category": "market",
+            "location": "Eveleigh / Redfern",
+        }),
     ),
 ]
 
@@ -101,7 +137,7 @@ def main() -> None:
     try:
         chunks_stored = save_documents_to_store(SYDNEY_INSIDER_DOCS)
     except Exception as exc:
-        print(f"ERROR: Seeding failed — {exc}")
+        print(f"ERROR: Seeding failed - {exc}")
         print("Make sure OPENAI_API_KEY is set in your .env file.")
         sys.exit(1)
 

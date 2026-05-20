@@ -6,12 +6,11 @@ from typing import Optional
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
+from app.config import ENABLE_SCHEDULER, REFRESH_INTERVAL_MINUTES
 from app.rag.ingestion import Scraper, SourceConfig
 from app.rag.retriever import ingest_documents
 
 logger = logging.getLogger(__name__)
-
-REFRESH_INTERVAL_MINUTES = 15
 
 REALTIME_SOURCES = [
     SourceConfig(
@@ -67,6 +66,11 @@ _scheduler: Optional[BackgroundScheduler] = None
 
 def start_scheduler() -> BackgroundScheduler:
     global _scheduler
+
+    if not ENABLE_SCHEDULER:
+        logger.info("Realtime refresh scheduler is disabled")
+        _scheduler = create_scheduler()
+        return _scheduler
 
     if _scheduler and _scheduler.running:
         return _scheduler
