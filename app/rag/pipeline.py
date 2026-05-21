@@ -132,16 +132,16 @@ def is_data_stale(doc: Document) -> Tuple[bool, Optional[str]]:
 
 
 def retrieve_with_scoring(query: str, top_k: int = TOP_K_RESULTS) -> RetrievalResult:
-    # 1. Fetch results (Assuming this returns List[Tuple[Document, float]])
-    results: List[Tuple[Document, float]] = retrieve_documents(query, top_k=top_k)
+    # 1. Fetch results
+    results: List[Document] = retrieve_documents(query, top_k=top_k)
     
     valid_docs: List[Document] = []
     valid_scores: List[float] = []
     staleness_warnings: List[str] = []
     threshold_warnings = 0
 
-    # 2. Correctly unpack the tuple
-    for doc, score in results:
+    # 2. Process each document
+    for doc in results:
         # Pylance now recognizes 'doc' as Document and 'score' as float
         is_stale, warning = is_data_stale(doc)
         
@@ -152,6 +152,7 @@ def retrieve_with_scoring(query: str, top_k: int = TOP_K_RESULTS) -> RetrievalRe
 
         # Ensure similarity score is a valid float
         try:
+            score = doc.metadata.get("similarity_score", 0.0)
             similarity = max(0.0, min(1.0, float(score)))
         except (ValueError, TypeError):
             similarity = 0.0

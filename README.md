@@ -62,3 +62,25 @@ for that path.
 | GET | `/health` | Service health and vector backend |
 | POST | `/api/v1/query` | Generate a personalised insider tip |
 | POST | `/api/v1/ingest` | Scrape sources and store chunks |
+| POST | `/api/v1/squad-up/icebreaker` | Generate a Squad-Up icebreaker prompt |
+
+## Squad-Up Icebreaker Contract
+
+Request:
+
+```json
+{
+  "eventId": "11111111-1111-1111-1111-111111111111",
+  "memberCount": 3,
+  "memberIds": ["u1", "u2", "u3"],
+  "contextHints": ["Sydney coffee", "first meetup"]
+}
+```
+
+Response:
+
+```json
+{
+  "prompt": "What's one underrated local spot everyone should try together?"
+}
+```

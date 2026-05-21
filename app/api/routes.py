@@ -7,15 +7,17 @@ import time
 from collections import defaultdict, deque
 from threading import Lock
 from typing import Any, List, Optional
+from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, status
 from openai import APIConnectionError, APITimeoutError, OpenAIError, RateLimitError
-from pydantic import BaseModel, Field, HttpUrl, field_validator
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator, model_validator
 
 from app.config import VECTOR_STORE
 from app.rag.ingestion import SYDNEY_SOURCES, Scraper, SourceConfig
 from app.rag.pipeline import generate_insider_tip
 from app.rag.retriever import ingest_documents
+from app.squad_up.icebreaker import generate_icebreaker_prompt
 from app.utils.validation import sanitize_vibe
 
 logger = logging.getLogger(__name__)
@@ -89,6 +91,52 @@ class IngestRequest(BaseModel):
 class IngestResponse(BaseModel):
     chunks_ingested: int
     sources_scraped: int
+
+
+class IcebreakerRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    event_id: UUID = Field(alias="eventId", description="Squad-Up event identifier")
+    member_count: int = Field(alias="memberCount", ge=2, le=50)
+    member_ids: List[str] = Field(alias="memberIds", min_length=2, max_length=50)
+    context_hints: List[str] = Field(default_factory=list, alias="contextHints", max_length=12)
+
+    @field_validator("member_ids")
+    @classmethod
+    def validate_member_ids(cls, value: List[str]) -> List[str]:
+        cleaned = [member_id.strip() for member_id in value if member_id.strip()]
+        if len(cleaned) < 2:
+            raise ValueError("memberIds must contain at least two non-empty member IDs")
+        if len(set(cleaned)) != len(cleaned):
+            raise ValueError("memberIds must not contain duplicates")
+        return cleaned
+
+    @field_validator("context_hints", mode="before")
+    @classmethod
+    def default_context_hints(cls, value: Any) -> Any:
+        if value is None:
+            return []
+        return value
+
+    @field_validator("context_hints")
+    @classmethod
+    def validate_context_hints(cls, value: List[str]) -> List[str]:
+        cleaned: List[str] = []
+        for hint in value:
+            normalized = " ".join(hint.strip().split())
+            if normalized:
+                cleaned.append(normalized[:160])
+        return cleaned
+
+    @model_validator(mode="after")
+    def validate_member_count_matches_ids(self) -> "IcebreakerRequest":
+        if self.member_count != len(self.member_ids):
+            raise ValueError("memberCount must match the number of memberIds")
+        return self
+
+
+class IcebreakerResponse(BaseModel):
+    prompt: str
 
 
 # ---------------------------------------------------------------------------
@@ -202,3 +250,57 @@ def ingest(payload: IngestRequest):
         )
 
     return IngestResponse(chunks_ingested=chunks, sources_scraped=len(docs))
+
+
+@router.post(
+    "/api/v1/squad-up/icebreaker",
+    response_model=IcebreakerResponse,
+    summary="Generate a Squad-Up icebreaker prompt",
+    tags=["squad-up"],
+)
+def create_squad_up_icebreaker(payload: IcebreakerRequest):
+    try:
+        prompt = generate_icebreaker_prompt(
+            event_id=payload.event_id,
+            member_count=payload.member_count,
+            member_ids=payload.member_ids,
+            context_hints=payload.context_hints,
+        )
+    except APITimeoutError:
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail="OpenAI request timed out — please retry.",
+        )
+    except APIConnectionError:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Could not reach OpenAI — please retry.",
+        )
+    except RateLimitError:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="OpenAI rate limit reached — slow down and retry.",
+        )
+    except OpenAIError:
+        logger.exception("OpenAI failed while generating Squad-Up icebreaker.")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Icebreaker generation is temporarily unavailable.",
+        )
+    except Exception as exc:
+        logger.exception("Unexpected error while generating Squad-Up icebreaker: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An unexpected error occurred.",
+        )
+
+    return IcebreakerResponse(prompt=prompt)
+
+
+@router.post(
+    "/api/v1/icebreaker",
+    response_model=IcebreakerResponse,
+    include_in_schema=False,
+)
+def create_icebreaker(payload: IcebreakerRequest):
+    return create_squad_up_icebreaker(payload)
